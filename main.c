@@ -201,7 +201,7 @@ static int __init khttpd_init(void)
     err = init_http_routes();
     if (err < 0) {
         pr_err("failed to initialize http routes\n");
-        return err;
+        goto err_free_cpumask;
     }
 
     if (!(http_buf_pool = mempool_create(POOL_MIN_NR, http_buf_alloc,
