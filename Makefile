@@ -1,4 +1,5 @@
-KDIR=/lib/modules/$(shell uname -r)/build
+PWD := $(CURDIR)
+KDIR ?= /lib/modules/$(shell uname -r)/build
 
 CFLAGS_user = -std=gnu11 -Wall -Wextra -Werror
 LDFLAGS_user = -lpthread

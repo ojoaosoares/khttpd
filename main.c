@@ -11,8 +11,8 @@
 
 #include "http_server.h"
 
-#define DEFAULT_PORT 8081
-#define DEFAULT_BACKLOG 100
+#define DEFAULT_PORT 9000
+#define DEFAULT_BACKLOG 65535
 #define POOL_MIN_NR 4
 #define ACCEPT_TIMEOUT_MS 5000
 
@@ -170,9 +170,16 @@ static int __init khttpd_init(void)
 {
     int err;
 
+    err = init_http_routes();
+    if (err < 0) {
+        pr_err("failed to initialize http routes\n");
+        return err;
+    }
+
     if (!(http_buf_pool = mempool_create(POOL_MIN_NR, http_buf_alloc,
                                          http_buf_free, NULL))) {
         pr_err("failed to create mempool\n");
+        cleanup_http_routes();
         return -ENOMEM;
     }
     err = open_listen_socket(port, backlog, &listen_socket);
@@ -194,6 +201,7 @@ err_close_socket:
 err_destroy_pool:
     mempool_destroy(http_buf_pool);
     http_buf_pool = NULL;
+    cleanup_http_routes();
     return err;
 }
 
@@ -204,6 +212,7 @@ static void __exit khttpd_exit(void)
     kthread_stop(http_server);
     close_listen_socket(listen_socket);
     mempool_destroy(http_buf_pool);
+    cleanup_http_routes();
     pr_info("module unloaded\n");
 }
 

@@ -5,8 +5,10 @@
 #include <linux/list.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/slab.h>
 #include <linux/tcp.h>
 #include <linux/version.h>
+#include <linux/vmalloc.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
 #define kthread_complete_and_exit(comp, code) complete_and_exit(comp, code)
@@ -93,18 +95,169 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+struct http_route {
+    const char *url;
+    char *resp_keepalive;
+    size_t resp_keepalive_len;
+    char *resp_close;
+    size_t resp_close_len;
+};
+
+struct route_def {
+    const char *url;
+    const char *body;
+    size_t body_len;
+};
+
+static const struct route_def default_routes[] = {
+    {"/teste",          "Hello, world!", 13},
+    {"/16b",            NULL,            16},
+    {"/64b",            NULL,            64},
+    {"/256b",           NULL,           256},
+    {"/512b",           NULL,           512},
+    {"/1k",             NULL,          1000},
+    {"/unaccelerated",  NULL,          1000},
+    {"/passthrough",    NULL,          1000},
+    {"/2k",             NULL,          2000},
+    {"/4k",             NULL,          4000},
+    {"/large",          NULL,          4000},
+    {"/8k",             NULL,          8000},
+    {"/16k",            NULL,         16000},
+    {"/32k",            NULL,         32000},
+    {"/64k",            NULL,         64000},
+    {"/128k",           NULL,        128000},
+    {"/256k",           NULL,        256000},
+};
+#define NUM_ROUTES ARRAY_SIZE(default_routes)
+
+static struct http_route parsed_routes[NUM_ROUTES];
+static struct http_route fallback_route;
+
+static int build_http_response(const char *body,
+                               size_t body_len,
+                               int keep_alive,
+                               char **out_buf,
+                               size_t *out_len)
+{
+    char hdr[256];
+    int hdr_len;
+    size_t total_len;
+    char *buf;
+
+    hdr_len = snprintf(hdr, sizeof(hdr),
+                       "HTTP/1.1 200 OK\r\n"
+                       "Server: " KBUILD_MODNAME "\r\n"
+                       "Content-Type: text/plain\r\n"
+                       "Content-Length: %zu\r\n"
+                       "Connection: %s\r\n\r\n",
+                       body_len, keep_alive ? "Keep-Alive" : "Close");
+    if (hdr_len < 0 || (size_t) hdr_len >= sizeof(hdr))
+        return -EINVAL;
+
+    total_len = (size_t) hdr_len + body_len;
+    buf = kvmalloc(total_len, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    memcpy(buf, hdr, hdr_len);
+    if (body)
+        memcpy(buf + hdr_len, body, body_len);
+    else
+        memset(buf + hdr_len, 'X', body_len);
+
+    *out_buf = buf;
+    *out_len = total_len;
+    return 0;
+}
+
+int init_http_routes(void)
+{
+    size_t i;
+    int ret;
+
+    for (i = 0; i < NUM_ROUTES; i++) {
+        parsed_routes[i].url = default_routes[i].url;
+        ret = build_http_response(default_routes[i].body, default_routes[i].body_len,
+                                  1, &parsed_routes[i].resp_keepalive,
+                                  &parsed_routes[i].resp_keepalive_len);
+        if (ret < 0)
+            goto err_free;
+
+        ret = build_http_response(default_routes[i].body, default_routes[i].body_len,
+                                  0, &parsed_routes[i].resp_close,
+                                  &parsed_routes[i].resp_close_len);
+        if (ret < 0)
+            goto err_free;
+    }
+
+    fallback_route.url = "*";
+    ret = build_http_response("Hello from khttpd!\r\n", 19, 1,
+                              &fallback_route.resp_keepalive,
+                              &fallback_route.resp_keepalive_len);
+    if (ret < 0)
+        goto err_free;
+
+    ret = build_http_response("Hello from khttpd!\r\n", 19, 0,
+                              &fallback_route.resp_close,
+                              &fallback_route.resp_close_len);
+    if (ret < 0)
+        goto err_free;
+
+    pr_info("Registered %zu benchmark payload routes\n", NUM_ROUTES);
+    return 0;
+
+err_free:
+    cleanup_http_routes();
+    return ret;
+}
+
+void cleanup_http_routes(void)
+{
+    size_t i;
+
+    for (i = 0; i < NUM_ROUTES; i++) {
+        kvfree(parsed_routes[i].resp_keepalive);
+        parsed_routes[i].resp_keepalive = NULL;
+        parsed_routes[i].resp_keepalive_len = 0;
+
+        kvfree(parsed_routes[i].resp_close);
+        parsed_routes[i].resp_close = NULL;
+        parsed_routes[i].resp_close_len = 0;
+    }
+
+    kvfree(fallback_route.resp_keepalive);
+    fallback_route.resp_keepalive = NULL;
+    fallback_route.resp_keepalive_len = 0;
+
+    kvfree(fallback_route.resp_close);
+    fallback_route.resp_close = NULL;
+    fallback_route.resp_close_len = 0;
+}
+
 static int http_server_response(struct http_request *request, int keep_alive)
 {
-    char *response;
+    const struct http_route *route = NULL;
+    size_t i;
 
-    pr_info("requested_url = %s\n", request->request_url);
-    if (request->method != HTTP_GET)
-        response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
+    if (request->method != HTTP_GET) {
+        const char *resp = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
+        return http_server_send(request->socket, resp, strlen(resp));
+    }
+
+    for (i = 0; i < NUM_ROUTES; i++) {
+        if (strcmp(request->request_url, parsed_routes[i].url) == 0) {
+            route = &parsed_routes[i];
+            break;
+        }
+    }
+
+    if (!route)
+        route = &fallback_route;
+
+    if (keep_alive)
+        return http_server_send(request->socket, route->resp_keepalive, route->resp_keepalive_len);
     else
-        response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
-                              : HTTP_RESPONSE_200_DUMMY;
-    http_server_send(request->socket, response, strlen(response));
-    return 0;
+        return http_server_send(request->socket, route->resp_close, route->resp_close_len);
 }
 
 static int http_parser_callback_message_begin(http_parser *parser)
@@ -121,7 +274,11 @@ static int http_parser_callback_request_url(http_parser *parser,
                                             size_t len)
 {
     struct http_request *request = parser->data;
-    strncat(request->request_url, p, len);
+    size_t cur_len = strlen(request->request_url);
+    if (cur_len + len < sizeof(request->request_url)) {
+        memcpy(request->request_url + cur_len, p, len);
+        request->request_url[cur_len + len] = '\0';
+    }
     return 0;
 }
 

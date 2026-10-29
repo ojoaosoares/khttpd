@@ -10,6 +10,8 @@ struct http_server_param {
     struct socket *listen_socket;
 };
 
+extern int init_http_routes(void);
+extern void cleanup_http_routes(void);
 extern int http_server_daemon(void *arg);
 
 static inline void *http_buf_alloc(gfp_t gfp_mask, void *pool_data)
