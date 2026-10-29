@@ -433,6 +433,10 @@ int http_server_daemon(void *arg)
          * default so idle keep-alive connections are not dropped.
          */
         WRITE_ONCE(socket->sk->sk_rcvtimeo, MAX_SCHEDULE_TIMEOUT);
+
+        /* Disable Nagle algorithm on accepted client socket to eliminate delayed ACKs */
+        tcp_sock_set_nodelay(socket->sk);
+
         conn = kmalloc(sizeof(*conn), GFP_KERNEL);
         if (!conn) {
             pr_err("can't allocate memory for connection\n");
