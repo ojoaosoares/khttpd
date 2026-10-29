@@ -17,6 +17,7 @@
 #define ACCEPT_TIMEOUT_MS 5000
 
 mempool_t *http_buf_pool;
+struct workqueue_struct *khttpd_wq;
 
 static ushort port = DEFAULT_PORT;
 module_param(port, ushort, S_IRUGO);
@@ -182,10 +183,18 @@ static int __init khttpd_init(void)
         cleanup_http_routes();
         return -ENOMEM;
     }
+
+    khttpd_wq = alloc_workqueue("khttpd_wq", WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+    if (!khttpd_wq) {
+        pr_err("failed to create khttpd workqueue\n");
+        err = -ENOMEM;
+        goto err_destroy_pool;
+    }
+
     err = open_listen_socket(port, backlog, &listen_socket);
     if (err < 0) {
         pr_err("can't open listen socket\n");
-        goto err_destroy_pool;
+        goto err_destroy_wq;
     }
     param.listen_socket = listen_socket;
     http_server = kthread_run(http_server_daemon, &param, KBUILD_MODNAME);
@@ -198,6 +207,9 @@ static int __init khttpd_init(void)
 
 err_close_socket:
     close_listen_socket(listen_socket);
+err_destroy_wq:
+    destroy_workqueue(khttpd_wq);
+    khttpd_wq = NULL;
 err_destroy_pool:
     mempool_destroy(http_buf_pool);
     http_buf_pool = NULL;
@@ -208,9 +220,12 @@ err_destroy_pool:
 static void __exit khttpd_exit(void)
 {
     send_sig(SIGTERM, http_server, 1);
-    /* Returns only after the daemon has drained every worker */
     kthread_stop(http_server);
     close_listen_socket(listen_socket);
+    if (khttpd_wq) {
+        destroy_workqueue(khttpd_wq);
+        khttpd_wq = NULL;
+    }
     mempool_destroy(http_buf_pool);
     cleanup_http_routes();
     pr_info("module unloaded\n");

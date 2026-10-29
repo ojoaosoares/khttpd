@@ -9,6 +9,7 @@
 #include <linux/tcp.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
 #define kthread_complete_and_exit(comp, code) complete_and_exit(comp, code)
@@ -48,14 +49,11 @@ struct http_request {
     int complete;
 };
 
-/* conn_list is only touched by the daemon thread, so no lock is needed. */
-struct khttpd_conn {
-    struct list_head node;
+/* Work structure for each accepted connection dispatched to khttpd_wq */
+struct khttpd_work {
+    struct work_struct work;
     struct socket *socket;
-    struct completion done;
 };
-
-static LIST_HEAD(conn_list);
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
@@ -318,7 +316,7 @@ static int http_parser_callback_message_complete(http_parser *parser)
     return 0;
 }
 
-static int http_server_worker(void *arg)
+static void http_server_worker_fn(struct work_struct *work)
 {
     char *buf;
     struct http_parser parser;
@@ -332,17 +330,12 @@ static int http_server_worker(void *arg)
         .on_message_complete = http_parser_callback_message_complete,
     };
     struct http_request request;
-    struct khttpd_conn *conn = (struct khttpd_conn *) arg;
-    struct socket *socket = conn->socket;
-    int err = 0;
-
-    allow_signal(SIGKILL);
-    allow_signal(SIGTERM);
+    struct khttpd_work *kw = container_of(work, struct khttpd_work, work);
+    struct socket *socket = kw->socket;
 
     buf = mempool_alloc(http_buf_pool, GFP_KERNEL);
     if (!buf) {
-        pr_err("can't allocate memory!\n");
-        err = -ENOMEM;
+        pr_err("can't allocate memory for worker buffer!\n");
         goto out;
     }
 
@@ -351,66 +344,27 @@ static int http_server_worker(void *arg)
     parser.data = &request;
     while (!kthread_should_stop()) {
         int ret = http_server_recv(socket, buf, RECV_BUFFER_SIZE - 1);
-        if (ret <= 0) {
-            if (ret) {
-                pr_err("recv error: %d\n", ret);
-                err = ret;
-            }
+        if (ret <= 0)
             goto out_free_buf;
-        }
+
         http_parser_execute(&parser, &setting, buf, ret);
         if (request.complete && !http_should_keep_alive(&parser))
             goto out_free_buf;
         memset(buf, 0, RECV_BUFFER_SIZE);
     }
+
 out_free_buf:
     mempool_free(buf, http_buf_pool);
 out:
     kernel_sock_shutdown(socket, SHUT_RDWR);
-    /* Does not return, and completes from core kernel code, so no
-     * module code runs after this.
-     */
-    kthread_complete_and_exit(&conn->done, err);
-}
-
-/* Only safe once the worker's completion has been observed. */
-static void free_conn(struct khttpd_conn *conn)
-{
-    list_del(&conn->node);
-    sock_release(conn->socket);
-    kfree(conn);
-}
-
-static void reap_finished_workers(void)
-{
-    struct khttpd_conn *conn, *tmp;
-
-    list_for_each_entry_safe (conn, tmp, &conn_list, node) {
-        if (try_wait_for_completion(&conn->done))
-            free_conn(conn);
-    }
-}
-
-/* Shut every socket down to break the workers out of recv, then wait
- * for them.  Safe to destroy http_buf_pool once this returns.
- */
-static void http_server_stop_workers(void)
-{
-    struct khttpd_conn *conn, *tmp;
-
-    list_for_each_entry (conn, &conn_list, node)
-        kernel_sock_shutdown(conn->socket, SHUT_RDWR);
-    list_for_each_entry_safe (conn, tmp, &conn_list, node) {
-        wait_for_completion(&conn->done);
-        free_conn(conn);
-    }
+    sock_release(socket);
+    kfree(kw);
 }
 
 int http_server_daemon(void *arg)
 {
     struct socket *socket;
-    struct task_struct *worker;
-    struct khttpd_conn *conn;
+    struct khttpd_work *kw;
     struct http_server_param *param = (struct http_server_param *) arg;
 
     allow_signal(SIGKILL);
@@ -419,12 +373,11 @@ int http_server_daemon(void *arg)
     while (!kthread_should_stop()) {
         int err;
 
-        reap_finished_workers();
         err = kernel_accept(param->listen_socket, &socket, 0);
         if (err < 0) {
             if (signal_pending(current))
                 break;
-            /* -EAGAIN means the accept timeout expired; loop back to reap */
+            /* -EAGAIN means the accept timeout expired; loop back */
             if (err != -EAGAIN)
                 pr_err("kernel_accept() error: %d\n", err);
             continue;
@@ -437,26 +390,17 @@ int http_server_daemon(void *arg)
         /* Disable Nagle algorithm on accepted client socket to eliminate delayed ACKs */
         tcp_sock_set_nodelay(socket->sk);
 
-        conn = kmalloc(sizeof(*conn), GFP_KERNEL);
-        if (!conn) {
-            pr_err("can't allocate memory for connection\n");
+        kw = kmalloc(sizeof(*kw), GFP_KERNEL);
+        if (!kw) {
+            pr_err("can't allocate memory for connection work\n");
             kernel_sock_shutdown(socket, SHUT_RDWR);
             sock_release(socket);
             continue;
         }
-        conn->socket = socket;
-        init_completion(&conn->done);
-        worker = kthread_run(http_server_worker, conn, KBUILD_MODNAME);
-        if (IS_ERR(worker)) {
-            pr_err("can't create more worker process\n");
-            kernel_sock_shutdown(socket, SHUT_RDWR);
-            sock_release(socket);
-            kfree(conn);
-            continue;
-        }
-        list_add(&conn->node, &conn_list);
+        kw->socket = socket;
+        INIT_WORK(&kw->work, http_server_worker_fn);
+        queue_work(khttpd_wq, &kw->work);
     }
-    /* The loop also ends on a signal, so drain here, not in khttpd_exit() */
-    http_server_stop_workers();
+
     return 0;
 }

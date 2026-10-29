@@ -10,6 +10,7 @@ struct http_server_param {
     struct socket *listen_socket;
 };
 
+extern struct workqueue_struct *khttpd_wq;
 extern int init_http_routes(void);
 extern void cleanup_http_routes(void);
 extern int http_server_daemon(void *arg);
