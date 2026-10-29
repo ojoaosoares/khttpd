@@ -1,5 +1,6 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/cpumask.h>
 #include <linux/jiffies.h>
 #include <linux/kthread.h>
 #include <linux/mempool.h>
@@ -7,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/tcp.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 #include <net/sock.h>
 
 #include "http_server.h"
@@ -18,11 +20,16 @@
 
 mempool_t *http_buf_pool;
 struct workqueue_struct *khttpd_wq;
+cpumask_var_t khttpd_cpumask;
 
 static ushort port = DEFAULT_PORT;
 module_param(port, ushort, S_IRUGO);
 static ushort backlog = DEFAULT_BACKLOG;
 module_param(backlog, ushort, S_IRUGO);
+/* num_cores: number of CPU cores to pin khttpd to (0 = all cores, default).
+ * Example: insmod khttpd.ko num_cores=2 pins to cpu0 and cpu1. */
+static uint num_cores = 0;
+module_param(num_cores, uint, S_IRUGO);
 
 static struct socket *listen_socket;
 static struct http_server_param param;
@@ -170,6 +177,26 @@ static void close_listen_socket(struct socket *socket)
 static int __init khttpd_init(void)
 {
     int err;
+    uint cpu, pinned = 0;
+
+    /* Build the CPU affinity mask for the daemon + workqueue workers.
+     * num_cores=0 means "all CPUs" (leave mask empty → no pinning).
+     * num_cores=N pins to the first N online CPUs (cpu0, cpu1, …, cpuN-1). */
+    if (!zalloc_cpumask_var(&khttpd_cpumask, GFP_KERNEL)) {
+        pr_err("failed to allocate cpumask\n");
+        return -ENOMEM;
+    }
+    if (num_cores > 0) {
+        for_each_online_cpu(cpu) {
+            cpumask_set_cpu(cpu, khttpd_cpumask);
+            if (++pinned >= num_cores)
+                break;
+        }
+        pr_info("CPU affinity: pinned to %u core(s) (%*pbl)\n",
+                pinned, cpumask_pr_args(khttpd_cpumask));
+    } else {
+        pr_info("CPU affinity: unrestricted (num_cores=0)\n");
+    }
 
     err = init_http_routes();
     if (err < 0) {
@@ -181,7 +208,8 @@ static int __init khttpd_init(void)
                                          http_buf_free, NULL))) {
         pr_err("failed to create mempool\n");
         cleanup_http_routes();
-        return -ENOMEM;
+        err = -ENOMEM;
+        goto err_free_cpumask;
     }
 
     khttpd_wq = alloc_workqueue("khttpd_wq", WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
@@ -214,6 +242,8 @@ err_destroy_pool:
     mempool_destroy(http_buf_pool);
     http_buf_pool = NULL;
     cleanup_http_routes();
+err_free_cpumask:
+    free_cpumask_var(khttpd_cpumask);
     return err;
 }
 
@@ -228,6 +258,7 @@ static void __exit khttpd_exit(void)
     }
     mempool_destroy(http_buf_pool);
     cleanup_http_routes();
+    free_cpumask_var(khttpd_cpumask);
     pr_info("module unloaded\n");
 }
 

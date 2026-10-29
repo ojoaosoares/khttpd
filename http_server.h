@@ -1,6 +1,7 @@
 #ifndef KHTTPD_HTTP_SERVER_H
 #define KHTTPD_HTTP_SERVER_H
 
+#include <linux/cpumask.h>
 #include <net/sock.h>
 
 #define RECV_BUFFER_SIZE 4096
@@ -11,6 +12,9 @@ struct http_server_param {
 };
 
 extern struct workqueue_struct *khttpd_wq;
+/* cpumask used to pin the daemon and workqueue workers to a subset of cores.
+ * Set by main.c based on the num_cores module parameter (0 = all CPUs). */
+extern cpumask_var_t khttpd_cpumask;
 extern int init_http_routes(void);
 extern void cleanup_http_routes(void);
 extern int http_server_daemon(void *arg);

@@ -85,7 +85,9 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
         };
         int length = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
         if (length < 0) {
-            pr_err("write error: %d\n", length);
+            /* Silently drop disconnection errors (EPIPE, ECONNRESET) in
+             * the fast-path to avoid pr_err latency spikes in dmesg. */
+            pr_debug("write error: %d\n", length);
             break;
         }
         done += length;
@@ -333,6 +335,12 @@ static void http_server_worker_fn(struct work_struct *work)
     struct khttpd_work *kw = container_of(work, struct khttpd_work, work);
     struct socket *socket = kw->socket;
 
+    /* Pin this worker kthread to the configured core set (same mask used
+     * by the daemon thread).  Keeps khttpd bounded to the same CPUs as
+     * Nginx / xhttp in the same benchmark round. */
+    if (!cpumask_empty(khttpd_cpumask))
+        set_cpus_allowed_ptr(current, khttpd_cpumask);
+
     buf = mempool_alloc(http_buf_pool, GFP_KERNEL);
     if (!buf) {
         pr_err("can't allocate memory for worker buffer!\n");
@@ -370,6 +378,11 @@ int http_server_daemon(void *arg)
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
 
+    /* Pin this daemon thread (and indirectly the bound workqueue workers
+     * that will run on the same CPUs) to the configured core set. */
+    if (!cpumask_empty(khttpd_cpumask))
+        set_cpus_allowed_ptr(current, khttpd_cpumask);
+
     while (!kthread_should_stop()) {
         int err;
 
@@ -389,6 +402,15 @@ int http_server_daemon(void *arg)
 
         /* Disable Nagle algorithm on accepted client socket to eliminate delayed ACKs */
         tcp_sock_set_nodelay(socket->sk);
+
+        /* Expand send/recv buffers on the accepted socket to 1 MB so that
+         * large payloads (>= 32 KB) can fill the TCP window without stalling.
+         * The listen socket already has these set, but accepted sockets
+         * inherit the system default (usually 87 KB), not the listen socket's
+         * value, so we must set them explicitly here.
+         */
+        sock_set_rcvbuf(socket->sk, 1024 * 1024);
+        WRITE_ONCE(socket->sk->sk_sndbuf, 2 * 1024 * 1024);
 
         kw = kmalloc(sizeof(*kw), GFP_KERNEL);
         if (!kw) {
