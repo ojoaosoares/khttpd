@@ -212,7 +212,9 @@ static int __init khttpd_init(void)
         goto err_free_cpumask;
     }
 
-    khttpd_wq = alloc_workqueue("khttpd_wq", WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+    atomic_set(&khttpd_stopped, 0);
+
+    khttpd_wq = alloc_workqueue("khttpd_wq", WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
     if (!khttpd_wq) {
         pr_err("failed to create khttpd workqueue\n");
         err = -ENOMEM;
@@ -249,10 +251,13 @@ err_free_cpumask:
 
 static void __exit khttpd_exit(void)
 {
+    /* Signal all workers to stop and immediately shutdown active sockets */
+    khttpd_shutdown_all_sockets();
     send_sig(SIGTERM, http_server, 1);
     kthread_stop(http_server);
     close_listen_socket(listen_socket);
     if (khttpd_wq) {
+        drain_workqueue(khttpd_wq);
         destroy_workqueue(khttpd_wq);
         khttpd_wq = NULL;
     }

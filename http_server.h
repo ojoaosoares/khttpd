@@ -15,6 +15,8 @@ extern struct workqueue_struct *khttpd_wq;
 /* cpumask used to pin the daemon and workqueue workers to a subset of cores.
  * Set by main.c based on the num_cores module parameter (0 = all CPUs). */
 extern cpumask_var_t khttpd_cpumask;
+extern atomic_t khttpd_stopped;
+extern void khttpd_shutdown_all_sockets(void);
 extern int init_http_routes(void);
 extern void cleanup_http_routes(void);
 extern int http_server_daemon(void *arg);

@@ -49,11 +49,31 @@ struct http_request {
     int complete;
 };
 
+atomic_t khttpd_stopped = ATOMIC_INIT(0);
+static LIST_HEAD(active_conns);
+static DEFINE_SPINLOCK(active_conns_lock);
+
 /* Work structure for each accepted connection dispatched to khttpd_wq */
 struct khttpd_work {
     struct work_struct work;
     struct socket *socket;
+    struct list_head node;
 };
+
+void khttpd_shutdown_all_sockets(void)
+{
+    struct khttpd_work *kw;
+    unsigned long flags;
+
+    atomic_set(&khttpd_stopped, 1);
+
+    spin_lock_irqsave(&active_conns_lock, flags);
+    list_for_each_entry (kw, &active_conns, node) {
+        if (kw->socket)
+            kernel_sock_shutdown(kw->socket, SHUT_RDWR);
+    }
+    spin_unlock_irqrestore(&active_conns_lock, flags);
+}
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
@@ -334,12 +354,7 @@ static void http_server_worker_fn(struct work_struct *work)
     struct http_request request;
     struct khttpd_work *kw = container_of(work, struct khttpd_work, work);
     struct socket *socket = kw->socket;
-
-    /* Pin this worker kthread to the configured core set (same mask used
-     * by the daemon thread).  Keeps khttpd bounded to the same CPUs as
-     * Nginx / xhttp in the same benchmark round. */
-    if (!cpumask_empty(khttpd_cpumask))
-        set_cpus_allowed_ptr(current, khttpd_cpumask);
+    unsigned long flags;
 
     buf = mempool_alloc(http_buf_pool, GFP_KERNEL);
     if (!buf) {
@@ -350,7 +365,7 @@ static void http_server_worker_fn(struct work_struct *work)
     request.socket = socket;
     http_parser_init(&parser, HTTP_REQUEST);
     parser.data = &request;
-    while (!kthread_should_stop()) {
+    while (!atomic_read(&khttpd_stopped)) {
         int ret = http_server_recv(socket, buf, RECV_BUFFER_SIZE - 1);
         if (ret <= 0)
             goto out_free_buf;
@@ -364,6 +379,10 @@ static void http_server_worker_fn(struct work_struct *work)
 out_free_buf:
     mempool_free(buf, http_buf_pool);
 out:
+    spin_lock_irqsave(&active_conns_lock, flags);
+    list_del_init(&kw->node);
+    spin_unlock_irqrestore(&active_conns_lock, flags);
+
     kernel_sock_shutdown(socket, SHUT_RDWR);
     sock_release(socket);
     kfree(kw);
@@ -395,10 +414,10 @@ int http_server_daemon(void *arg)
                 pr_err("kernel_accept() error: %d\n", err);
             continue;
         }
-        /* Accepted sockets inherit the listener's timeout. Restore the
-         * default so idle keep-alive connections are not dropped.
+        /* Accepted sockets inherit the listener's timeout. Set a 5-second
+         * keep-alive timeout so idle connections do not stall workers indefinitely.
          */
-        WRITE_ONCE(socket->sk->sk_rcvtimeo, MAX_SCHEDULE_TIMEOUT);
+        WRITE_ONCE(socket->sk->sk_rcvtimeo, msecs_to_jiffies(5000));
 
         /* Disable Nagle algorithm on accepted client socket to eliminate delayed ACKs */
         tcp_sock_set_nodelay(socket->sk);
@@ -420,7 +439,23 @@ int http_server_daemon(void *arg)
             continue;
         }
         kw->socket = socket;
+        INIT_LIST_HEAD(&kw->node);
         INIT_WORK(&kw->work, http_server_worker_fn);
+
+        {
+            unsigned long flags;
+            spin_lock_irqsave(&active_conns_lock, flags);
+            if (atomic_read(&khttpd_stopped)) {
+                spin_unlock_irqrestore(&active_conns_lock, flags);
+                kernel_sock_shutdown(socket, SHUT_RDWR);
+                sock_release(socket);
+                kfree(kw);
+                break;
+            }
+            list_add_tail(&kw->node, &active_conns);
+            spin_unlock_irqrestore(&active_conns_lock, flags);
+        }
+
         queue_work(khttpd_wq, &kw->work);
     }
 
