@@ -130,23 +130,23 @@ struct route_def {
 };
 
 static const struct route_def default_routes[] = {
-    {"/teste",          "Hello, world!", 13},
-    {"/16b",            NULL,            16},
-    {"/64b",            NULL,            64},
-    {"/256b",           NULL,           256},
-    {"/512b",           NULL,           512},
-    {"/1k",             NULL,          1000},
-    {"/unaccelerated",  NULL,          1000},
-    {"/passthrough",    NULL,          1000},
-    {"/2k",             NULL,          2000},
-    {"/4k",             NULL,          4000},
-    {"/large",          NULL,          4000},
-    {"/8k",             NULL,          8000},
-    {"/16k",            NULL,         16000},
-    {"/32k",            NULL,         32000},
-    {"/64k",            NULL,         64000},
-    {"/128k",           NULL,        128000},
-    {"/256k",           NULL,        256000},
+    {"/teste", "Hello, world!", 13},
+    {"/16b", NULL, 16},
+    {"/64b", NULL, 64},
+    {"/256b", NULL, 256},
+    {"/512b", NULL, 512},
+    {"/1k", NULL, 1000},
+    {"/unaccelerated", NULL, 1000},
+    {"/passthrough", NULL, 1000},
+    {"/2k", NULL, 2000},
+    {"/4k", NULL, 4000},
+    {"/large", NULL, 4000},
+    {"/8k", NULL, 8000},
+    {"/16k", NULL, 16000},
+    {"/32k", NULL, 32000},
+    {"/64k", NULL, 64000},
+    {"/128k", NULL, 128000},
+    {"/256k", NULL, 256000},
 };
 #define NUM_ROUTES ARRAY_SIZE(default_routes)
 
@@ -166,11 +166,11 @@ static int build_http_response(const char *body,
 
     hdr_len = snprintf(hdr, sizeof(hdr),
                        "HTTP/1.1 200 OK\r\n"
-                       "Server: " KBUILD_MODNAME "\r\n"
+                       "Server: xbench\r\n"
                        "Content-Type: text/plain\r\n"
                        "Content-Length: %zu\r\n"
                        "Connection: %s\r\n\r\n",
-                       body_len, keep_alive ? "Keep-Alive" : "Close");
+                       body_len, keep_alive ? "keep-alive" : "close");
     if (hdr_len < 0 || (size_t) hdr_len >= sizeof(hdr))
         return -EINVAL;
 
@@ -197,15 +197,16 @@ int init_http_routes(void)
 
     for (i = 0; i < NUM_ROUTES; i++) {
         parsed_routes[i].url = default_routes[i].url;
-        ret = build_http_response(default_routes[i].body, default_routes[i].body_len,
-                                  1, &parsed_routes[i].resp_keepalive,
+        ret = build_http_response(default_routes[i].body,
+                                  default_routes[i].body_len, 1,
+                                  &parsed_routes[i].resp_keepalive,
                                   &parsed_routes[i].resp_keepalive_len);
         if (ret < 0)
             goto err_free;
 
-        ret = build_http_response(default_routes[i].body, default_routes[i].body_len,
-                                  0, &parsed_routes[i].resp_close,
-                                  &parsed_routes[i].resp_close_len);
+        ret = build_http_response(
+            default_routes[i].body, default_routes[i].body_len, 0,
+            &parsed_routes[i].resp_close, &parsed_routes[i].resp_close_len);
         if (ret < 0)
             goto err_free;
     }
@@ -260,7 +261,8 @@ static int http_server_response(struct http_request *request, int keep_alive)
     size_t i;
 
     if (request->method != HTTP_GET) {
-        const char *resp = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
+        const char *resp =
+            keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
         return http_server_send(request->socket, resp, strlen(resp));
     }
 
@@ -275,9 +277,11 @@ static int http_server_response(struct http_request *request, int keep_alive)
         route = &fallback_route;
 
     if (keep_alive)
-        return http_server_send(request->socket, route->resp_keepalive, route->resp_keepalive_len);
+        return http_server_send(request->socket, route->resp_keepalive,
+                                route->resp_keepalive_len);
     else
-        return http_server_send(request->socket, route->resp_close, route->resp_close_len);
+        return http_server_send(request->socket, route->resp_close,
+                                route->resp_close_len);
 }
 
 static int http_parser_callback_message_begin(http_parser *parser)
@@ -415,11 +419,13 @@ int http_server_daemon(void *arg)
             continue;
         }
         /* Accepted sockets inherit the listener's timeout. Set a 5-second
-         * keep-alive timeout so idle connections do not stall workers indefinitely.
+         * keep-alive timeout so idle connections do not stall workers
+         * indefinitely.
          */
         WRITE_ONCE(socket->sk->sk_rcvtimeo, msecs_to_jiffies(5000));
 
-        /* Disable Nagle algorithm on accepted client socket to eliminate delayed ACKs */
+        /* Disable Nagle algorithm on accepted client socket to eliminate
+         * delayed ACKs */
         tcp_sock_set_nodelay(socket->sk);
 
         /* Expand send/recv buffers on the accepted socket to 1 MB so that
